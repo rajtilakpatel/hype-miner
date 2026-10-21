@@ -1,0 +1,152 @@
+require('dotenv').config();
+const express = require('express');
+const path = require('path');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
+const { migrate, seed } = require('./db');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Security & parsing
+app.use(helmet({
+  contentSecurityPolicy: false, // Telegram Mini Apps need flexible CSP
+  crossOriginEmbedderPolicy: false
+}));
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+
+// Rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, slow down' }
+});
+const mineLimiter = rateLimit({
+  windowMs: 10 * 1000,
+  max: 5,
+  message: { error: 'Mining too fast' }
+});
+
+app.use('/api', apiLimiter);
+
+// Routes
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/mine', mineLimiter, require('./routes/mine'));
+app.use('/api/tasks', require('./routes/tasks'));
+app.use('/api/referral', require('./routes/referral'));
+app.use('/api/profile', require('./routes/profile'));
+app.use('/api/wallet', require('./routes/wallet'));
+app.use('/api/swap', require('./routes/swap'));
+app.use('/api/market', require('./routes/market'));
+app.use('/api/leaderboard', require('./routes/leaderboard'));
+app.use('/api/admin', require('./routes/admin'));
+
+// Health
+app.get('/api/health', (req, res) => {
+  try {
+    const { getStore } = require('./db');
+    const s = getStore();
+    res.json({
+      ok: true,
+      users: (s.users || []).length,
+      tasks: (s.tasks || []).length,
+      time: new Date().toISOString()
+    });
+  } catch (e) {
+    res.json({ ok: true, time: new Date().toISOString() });
+  }
+});
+
+// Static frontend — hide admin.html from directory listing style access without path
+const publicDir = path.join(__dirname, '..', 'public');
+
+// Dynamic TON Connect manifest (absolute URLs required)
+app.get('/tonconnect-manifest.json', (req, res) => {
+  const proto = (req.get('x-forwarded-proto') || req.protocol || 'https').split(',')[0].trim();
+  const host = req.get('x-forwarded-host') || req.get('host') || 'localhost';
+  const origin = process.env.WEBAPP_URL || `${proto}://${host}`;
+  const base = origin.replace(/\/$/, '');
+  res.json({
+    url: base,
+    name: 'HYPE MINER',
+    iconUrl: base + '/assets/hype-coin.png',
+    termsOfUseUrl: base,
+    privacyPolicyUrl: base
+  });
+});
+
+app.use(express.static(publicDir, {
+  index: 'index.html',
+  // do not auto-serve admin as index
+}));
+
+// Admin panel — open in browser (not inside Mini App)
+// Default: /hq-control  (+ always also /admin for convenience)
+const adminPath = (process.env.ADMIN_PANEL_PATH || '/hq-control').replace(/\/$/, '');
+const adminPaths = new Set([adminPath, adminPath + '/', '/admin', '/admin/']);
+app.get([...adminPaths], (req, res) => {
+  res.sendFile(path.join(publicDir, 'admin.html'));
+});
+// Direct /admin.html only if explicitly chosen as panel path
+app.get('/admin.html', (req, res) => {
+  if (adminPath === '/admin.html' || adminPath === '/admin') {
+    return res.sendFile(path.join(publicDir, 'admin.html'));
+  }
+  res.status(404).send('Not found');
+});
+
+// SPA fallback
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api')) return res.status(404).json({ error: 'Not found' });
+  res.sendFile(path.join(publicDir, 'index.html'));
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Boot
+migrate();
+seed();
+
+// DIGGO-style 8h mining-pause reminders via Telegram bot
+try {
+  const { startMiningPauseScheduler } = require('./jobs/miningPauseNotify');
+  startMiningPauseScheduler(5 * 60 * 1000);
+} catch (err) {
+  console.warn('Mining pause scheduler not started:', err.message);
+}
+
+
+// Soft anti-sleep: ping own health URL every 10 min (helps free Render stay warmer)
+try {
+  const keepUrl = process.env.WEBAPP_URL || process.env.KEEP_ALIVE_URL || '';
+  if (keepUrl && process.env.DISABLE_KEEP_ALIVE !== 'true') {
+    const ping = () => {
+      const u = keepUrl.replace(/\/$/, '') + '/api/health';
+      fetch(u).catch(() => {});
+    };
+    setTimeout(ping, 30 * 1000);
+    setInterval(ping, 10 * 60 * 1000);
+    console.log('[keep-alive] pinging', keepUrl, 'every 10 min');
+  }
+} catch (e) {
+  console.warn('keep-alive not started', e.message);
+}
+
+app.listen(PORT, () => {
+  console.log(`HYPE MINER server running on port ${PORT}`);
+  console.log(`Open http://localhost:${PORT}`);
+  console.log(`Admin panel: http://localhost:${PORT}${adminPath}`);
+});
